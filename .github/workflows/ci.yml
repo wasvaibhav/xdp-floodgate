@@ -66,6 +66,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The artifact is built from the same commit that is tagged into the
+      # image below; both names carry the commit SHA.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev
+          sudo ln -sf /usr/include/$(uname -m)-linux-gnu/asm /usr/include/asm
+
+      - name: Build release artifact
+        run: |
+          go generate ./...
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o floodgate ./cmd/floodgate
+          tar -czf "floodgate-${{ github.sha }}-linux-amd64.tar.gz" \
+            floodgate deploy/floodgate.service deploy/floodgate.default README.md docs
+          sha256sum "floodgate-${{ github.sha }}-linux-amd64.tar.gz" \
+            > "floodgate-${{ github.sha }}-linux-amd64.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: floodgate-${{ github.sha }}-linux-amd64
+          path: |
+            floodgate-${{ github.sha }}-linux-amd64.tar.gz
+            floodgate-${{ github.sha }}-linux-amd64.tar.gz.sha256
+
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io

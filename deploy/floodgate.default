@@ -1,0 +1,8 @@
+# Interface protected by the XDP program (required).
+FLOODGATE_IFACE=eth0
+
+# Extra arguments for `floodgate start`, split on whitespace.
+# Examples:
+#   FLOODGATE_ARGS="-generic -ip-rate 1000 -ip-burst 2000"
+#   FLOODGATE_ARGS="-decap -trusted-ip-rate 0"
+FLOODGATE_ARGS=

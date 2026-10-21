@@ -40,9 +40,19 @@ struct fg_limit {
 };
 
 struct fg_config {
-	struct fg_limit ip;     // all packets, per source IP
-	struct fg_limit syn;    // TCP SYNs, per source IP
-	struct fg_limit global; // whole node; interval is the per-CPU share
+	struct fg_limit ip;          // all packets, per source IP
+	struct fg_limit syn;         // TCP SYNs, per source IP
+	struct fg_limit trusted_ip;  // same, for allowlisted sources
+	struct fg_limit trusted_syn; // same, for allowlisted sources
+	struct fg_limit global;      // whole node; interval is the per-CPU share
+};
+
+// Longest-prefix-match key for the allowlist. addr is raw network bytes;
+// IPv4 sources are looked up as IPv4-mapped IPv6 (::ffff:a.b.c.d), so one
+// trie holds both families. prefixlen is ignored on lookup.
+struct fg_lpm_key {
+	__u32 prefixlen;
+	__u8 addr[16];
 };
 
 // Source address. IPv4 is stored IPv4-mapped (::ffff:a.b.c.d) so one map
@@ -86,6 +96,28 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } config SEC(".maps");
 
+// Last successful policy write, nanoseconds since the Unix epoch. The
+// data plane never reads it; userspace exposes it so operators can alert
+// on stale policy after a failed rollout.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} applied SEC(".maps");
+
+// Start-time settings that are not rate limits. Written once by the
+// loader; set-limit and the control API do not touch it.
+//   decap: 1 = parse one level of IP-in-IP and limit the inner source.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} settings SEC(".maps");
+
 // Per-source-IP state. LRU: when full, the least recently seen IP is
 // evicted automatically, so memory is bounded no matter how many sources
 // show up. max_entries is overridden by the loader (--max-ips).
@@ -96,6 +128,17 @@ struct {
 	__type(value, struct fg_ip_state);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } ip_state SEC(".maps");
+
+// Sources that skip the default per-IP class and use the trusted limits
+// instead. LPM trie so operators can allow whole IPv4/IPv6 prefixes.
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(max_entries, 65536);
+	__type(key, struct fg_lpm_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} allowlist SEC(".maps");
 
 // Node-wide cap, split per CPU: each CPU has its own bucket with
 // 1/Nth of the rate, so no two CPUs ever touch the same memory.
@@ -163,6 +206,39 @@ static __always_inline int verdict(__u32 stat, __u64 bytes)
 	return stat == FG_STAT_PASS || stat == FG_STAT_NOT_IP ? XDP_PASS : XDP_DROP;
 }
 
+// Parse an inner IPv4 or IPv6 header at l3 and fill key/tcp. Returns 0 if
+// the inner header is malformed or of another family; the caller then
+// keeps the outer source, so a truncated tunnel cannot bypass the limit.
+static __always_inline int parse_inner(void *l3, __be16 proto, void *data_end,
+				       struct fg_ip_key *key,
+				       struct tcphdr **tcp)
+{
+	*tcp = NULL;
+	if (proto == bpf_htons(ETH_P_IP)) {
+		struct iphdr *iph = l3;
+
+		if ((void *)(iph + 1) > data_end || iph->ihl < 5)
+			return 0;
+		key->addr[2] = bpf_htonl(0xffff);
+		key->addr[3] = iph->saddr;
+		if (iph->protocol == IPPROTO_TCP &&
+		    !(iph->frag_off & bpf_htons(0x1fff)))
+			*tcp = (void *)iph + iph->ihl * 4;
+		return 1;
+	}
+	if (proto == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6 = l3;
+
+		if ((void *)(ip6 + 1) > data_end)
+			return 0;
+		__builtin_memcpy(key->addr, &ip6->saddr, sizeof(key->addr));
+		if (ip6->nexthdr == IPPROTO_TCP)
+			*tcp = (void *)(ip6 + 1);
+		return 1;
+	}
+	return 0;
+}
+
 // ---- program --------------------------------------------------------------
 
 SEC("xdp")
@@ -193,6 +269,8 @@ int xdp_floodgate(struct xdp_md *ctx)
 
 	struct fg_ip_key key = {};
 	struct tcphdr *tcp = NULL;
+	void *inner = NULL;
+	__be16 inner_proto = 0;
 
 	if (proto == bpf_htons(ETH_P_IP)) {
 		struct iphdr *iph = l3;
@@ -204,6 +282,16 @@ int xdp_floodgate(struct xdp_md *ctx)
 		if (iph->protocol == IPPROTO_TCP &&
 		    !(iph->frag_off & bpf_htons(0x1fff)))
 			tcp = (void *)iph + iph->ihl * 4;
+		// One level of IP-in-IP; fragmented outer packets are not
+		// decapsulated because the inner header may be incomplete.
+		if ((iph->protocol == IPPROTO_IPIP ||
+		     iph->protocol == IPPROTO_IPV6) &&
+		    !(iph->frag_off & bpf_htons(0x3fff))) {
+			inner = (void *)iph + iph->ihl * 4;
+			inner_proto = iph->protocol == IPPROTO_IPIP
+					      ? bpf_htons(ETH_P_IP)
+					      : bpf_htons(ETH_P_IPV6);
+		}
 	} else if (proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = l3;
 		if ((void *)(ip6 + 1) > data_end)
@@ -213,8 +301,30 @@ int xdp_floodgate(struct xdp_md *ctx)
 		// limited per IP, just not recognised as SYNs.
 		if (ip6->nexthdr == IPPROTO_TCP)
 			tcp = (void *)(ip6 + 1);
+		if (ip6->nexthdr == IPPROTO_IPIP || ip6->nexthdr == IPPROTO_IPV6) {
+			inner = (void *)(ip6 + 1);
+			inner_proto = ip6->nexthdr == IPPROTO_IPIP
+					      ? bpf_htons(ETH_P_IP)
+					      : bpf_htons(ETH_P_IPV6);
+		}
 	} else {
 		return verdict(FG_STAT_NOT_IP, bytes);
+	}
+
+	// Opt-in: trust the inner source only when the operator enabled
+	// decapsulation. A malformed inner header leaves the outer source in
+	// place instead of skipping the limit.
+	if (inner) {
+		__u32 *decap = bpf_map_lookup_elem(&settings, &zero);
+		if (decap && *decap) {
+			struct fg_ip_key inner_key = {};
+			struct tcphdr *inner_tcp = NULL;
+			if (parse_inner(inner, inner_proto, data_end,
+					&inner_key, &inner_tcp)) {
+				key = inner_key;
+				tcp = inner_tcp;
+			}
+		}
 	}
 
 	int is_syn = 0;
@@ -227,9 +337,20 @@ int xdp_floodgate(struct xdp_md *ctx)
 
 	__u64 now = bpf_ktime_get_ns();
 
+	// Allowlisted sources use the trusted class. The lookup is only a
+	// trie walk; the global cap below still applies to trusted traffic.
+	const struct fg_limit *ip_limit = &cfg->ip;
+	const struct fg_limit *syn_limit = &cfg->syn;
+	struct fg_lpm_key lk = { .prefixlen = 128 };
+	__builtin_memcpy(lk.addr, key.addr, sizeof(lk.addr));
+	if (bpf_map_lookup_elem(&allowlist, &lk)) {
+		ip_limit = &cfg->trusted_ip;
+		syn_limit = &cfg->trusted_syn;
+	}
+
 	// 1. Per-source limits. Checked before the global cap so one noisy IP
 	//    is dropped without eating the node-wide budget of everyone else.
-	if (cfg->ip.interval_ns || (is_syn && cfg->syn.interval_ns)) {
+	if (ip_limit->interval_ns || (is_syn && syn_limit->interval_ns)) {
 		struct fg_ip_state *st = bpf_map_lookup_elem(&ip_state, &key);
 		if (!st) {
 			// First packet from this IP: start with a full bucket.
@@ -238,11 +359,11 @@ int xdp_floodgate(struct xdp_md *ctx)
 			st = bpf_map_lookup_elem(&ip_state, &key);
 		}
 		if (st) {
-			if (is_syn && cfg->syn.interval_ns &&
-			    !gcra_allow(&st->syn_tat, now, &cfg->syn))
+			if (is_syn && syn_limit->interval_ns &&
+			    !gcra_allow(&st->syn_tat, now, syn_limit))
 				return verdict(FG_STAT_DROP_SYN, bytes);
-			if (cfg->ip.interval_ns &&
-			    !gcra_allow(&st->tat, now, &cfg->ip))
+			if (ip_limit->interval_ns &&
+			    !gcra_allow(&st->tat, now, ip_limit))
 				return verdict(FG_STAT_DROP_IP, bytes);
 		}
 	}

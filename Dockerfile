@@ -13,4 +13,8 @@ RUN go generate ./... && CGO_ENABLED=0 go build -o /floodgate ./cmd/floodgate
 
 FROM debian:bookworm-slim
 COPY --from=build /floodgate /usr/local/bin/floodgate
+# Healthy only when the pinned maps are readable, i.e. the data plane is
+# attached. Long-running containers should run `serve` after `start`.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["floodgate", "status"]
 ENTRYPOINT ["floodgate"]

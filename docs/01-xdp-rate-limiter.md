@@ -31,7 +31,7 @@ a verdict: `XDP_DROP`, `XDP_PASS` (continue into the normal stack),
   works on any interface, including Docker veths, so the demos use it.
 
 **Maps.** Key/value stores shared between the BPF program and userspace.
-They are how the two sides talk. Floodgate uses four:
+They are how the two sides talk. Floodgate uses seven:
 
 | map | type | why this type |
 |---|---|---|
@@ -39,6 +39,9 @@ They are how the two sides talk. Floodgate uses four:
 | `ip_state` | LRU_HASH | Per-source state. When full, the kernel evicts the least-recently-seen IP, so memory stays bounded however many IPs appear. |
 | `global_tat` | PERCPU_ARRAY | Node-wide cap. Each CPU gets its own copy, so CPUs never contend. |
 | `stats` | PERCPU_ARRAY | Counters. Per-CPU means no atomics. Userspace sums the copies. |
+| `allowlist` | LPM_TRIE | Trusted IPv4/IPv6 prefixes. Longest-prefix match, one lookup per packet. |
+| `applied` | ARRAY[1] | Unix timestamp of the last successful policy write, for staleness alerts. |
+| `settings` | ARRAY[1] | Start-time switches that are not rate limits (currently IP-in-IP decap). |
 
 **Per-CPU maps.** At millions of packets/s, if every CPU increments one
 shared counter, the cache line holding it moves between cores constantly
@@ -100,13 +103,18 @@ divides.
 ## Packet path
 
 ```
-packet -> parse eth / VLAN / IPv4|IPv6 / TCP flags
+packet -> parse eth / VLAN / (optional IPIP) / IPv4|IPv6 / TCP flags
        -> not IP?                      PASS  (ARP etc. must keep working)
        -> bare SYN over syn limit?     DROP  drop_syn
        -> over per-IP limit?           DROP  drop_ip
        -> over node-wide cap?          DROP  drop_global
        -> PASS
 ```
+
+With `start -decap`, one level of IPv4/IPv6 IP-in-IP is parsed first, so
+the inner client source drives the per-IP and allowlist lookups. It is
+opt-in because the inner source is only as trustworthy as the tunnel
+sender; see [05-deployment.md](05-deployment.md).
 
 Per-IP is checked **before** the global cap. That way one noisy IP is
 dropped without using up the node budget everyone else shares.
@@ -119,9 +127,9 @@ dropped without using up the node budget everyone else shares.
 | **Global cap split per CPU** (`rate / NumCPU`) | If RSS sends traffic to only a few RX queues, the effective cap is lower than configured. | Contention-free. Shard by RX-queue count if it matters (marked `ponytail:` in `loader.go`). |
 | **LRU map, 2M entries** | ~100 B/entry kernel-side, so **~200 MB at 2M**. When >2M sources are active, the oldest are evicted and restart with a full bucket. | `-max-ips` controls it. 500k ≈ 50 MB is plenty for most nodes behind a Maglev LB, which spreads clients across the fleet. |
 | **Spoofed-source floods** | Random source IPs each look "new", so the per-IP limit never triggers and the LRU churns. | The global PPS cap is the backstop for this case. The kernel's `net.ipv4.tcp_syncookies=1` handles SYN state exhaustion. XDP SYN-cookies are possible later. |
-| **Generous default per-IP limit** (1000 pps) | A single attacking IP gets 1000 pps. | Carrier-grade NAT can put hundreds of real users behind one IP. The allowlist and priority classes (phase 2) let this be tightened safely. |
+| **Generous default per-IP limit** (1000 pps) | A single attacking IP gets 1000 pps. | Carrier-grade NAT can put hundreds of real users behind one IP. The allowlist and trusted class (phase 2) let this be tightened safely. |
 | **No IPv6 extension-header walk** | IPv6 SYNs behind extension headers aren't SYN-limited (they're still per-IP limited). | Rare in practice. Bounded-loop parsing if needed. |
-| **No IPIP/GUE decapsulation** | Behind **Katran**, packets arrive IPIP-encapsulated, so the XDP program would see Katran's IP, not the client's. | Cloud L4 LBs (NLB etc.) preserve client IPs. Inner-header parsing gets added with the Katran deploy work. |
+| **IPIP is opt-in** (`-decap`) | Behind **Katran**, packets arrive IPIP-encapsulated; without `-decap` the per-IP limit applies to Katran's address. | One level of IPv4/IPv6 inner headers is parsed. Enable only when tunnels come from a trusted LB and filter IPIP at the edge; the inner source is spoofable. Fragmented outer packets and IPv6 extension headers fall back to the outer source. |
 
 ## Try it
 

@@ -1,0 +1,25 @@
+[Unit]
+Description=Floodgate XDP overload protection
+Documentation=https://github.com/wasvaibhav/xdp-floodgate
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/default/floodgate
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/floodgate
+# Clear pins left by a previous instance (no-op if nothing is attached),
+# then attach fresh. ExecStop detaches on shutdown. A crash of `serve`
+# leaves the XDP program attached; the restart clears and reattaches it.
+ExecStartPre=/usr/local/bin/floodgate stop
+ExecStartPre=/usr/local/bin/floodgate start -iface ${FLOODGATE_IFACE} $FLOODGATE_ARGS
+ExecStart=/usr/local/bin/floodgate serve
+ExecStop=/usr/local/bin/floodgate stop
+# BPF map accounting on kernels before memcg charging.
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

@@ -22,6 +22,11 @@ const (
 
 func loadTestObjects(t *testing.T, lim Limits) *floodgateObjects {
 	t.Helper()
+	return loadTestObjectsDecap(t, lim, false)
+}
+
+func loadTestObjectsDecap(t *testing.T, lim Limits, decap bool) *floodgateObjects {
+	t.Helper()
 	if os.Geteuid() != 0 {
 		t.Skip("needs root for BPF_PROG_RUN")
 	}
@@ -38,6 +43,13 @@ func loadTestObjects(t *testing.T, lim Limits) *floodgateObjects {
 	}
 	t.Cleanup(func() { objs.Close() })
 	if err := objs.Config.Put(uint32(0), toConfig(lim)); err != nil {
+		t.Fatal(err)
+	}
+	var decapValue uint32
+	if decap {
+		decapValue = 1
+	}
+	if err := objs.Settings.Put(uint32(0), decapValue); err != nil {
 		t.Fatal(err)
 	}
 	return &objs
